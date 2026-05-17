@@ -42,6 +42,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Automatically assigns `_id`, `_createdAt`, and `_updatedAt`.
    */
   async insert(document: T): Promise<InsertResult> {
+    if (!document) {
+      throw new ZerithDBError(ErrorCode.DB_WRITE_FAILED, "Document cannot be null or undefined");
+    }
     const now = Date.now();
     const id = uuidv7();
     const doc: Document<T> = {
@@ -65,6 +68,12 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Insert multiple documents in a single atomic operation.
    */
   async insertMany(documents: T[]): Promise<InsertResult[]> {
+    if (!documents || documents.length === 0) {
+      throw new ZerithDBError(ErrorCode.DB_WRITE_FAILED, "Documents array cannot be empty");
+    }
+    if (documents.some(doc => !doc)) {
+      throw new ZerithDBError(ErrorCode.DB_WRITE_FAILED, "Documents cannot be null or undefined");
+    }
     const now = Date.now();
     const docs = documents.map((doc) => ({
       ...doc,
@@ -120,6 +129,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Returns the number of updated documents.
    */
   async update(filter: QueryFilter<T>, spec: UpdateSpec<T>): Promise<number> {
+    if (!spec || (Object.keys(spec.$set ?? {}).length === 0 && Object.keys(spec.$unset ?? {}).length === 0)) {
+      throw new ZerithDBError(ErrorCode.DB_WRITE_FAILED, "Update spec cannot be empty");
+    }
     return wrapIDBOperation(
       ErrorCode.DB_WRITE_FAILED,
       `Failed to update documents in "${this.collectionName}"`,
@@ -285,6 +297,9 @@ export class DbClient {
   }
 
   collection<T extends Record<string, any>>(name: string): CollectionClient<T> {
+    if (!name || typeof name !== "string" || name.trim() === "") {
+      throw new ZerithDBError(ErrorCode.DB_INIT_FAILED, "Invalid collection name");
+    }
     if (!this.collections.has(name)) {
       const table = this.dexie.ensureCollection(name);
       this.collections.set(name, new CollectionClient<T>(table as Table<Document<T>>, name));

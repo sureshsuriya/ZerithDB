@@ -1,7 +1,7 @@
 {
-  "name": "zerithdb-react",
-  "version": "0.1.1",
-  "description": "React hooks and providers for ZerithDB",
+  "name": "zerithdb-vue",
+  "version": "0.1.0",
+  "description": "Vue composables and components for ZerithDB",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -16,32 +16,23 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "tsup src/index.tsx src/shared-worker.ts --format esm,cjs --dts --treeshake --external react",
-    "dev": "tsup src/index.tsx src/shared-worker.ts --format esm,cjs --dts --watch --external react",
+    "build": "tsup src/index.ts --format esm,cjs --dts --treeshake --external vue",
+    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --external vue",
     "clean": "rimraf dist"
   },
   "dependencies": {
-    "dexie": "^4.0.8",
     "zerithdb-sdk": "workspace:*",
     "zerithdb-ui-core": "workspace:*"
   },
   "peerDependencies": {
-    "react": "^18.0.0 || ^19.0.0",
-    "react-dom": "^18.0.0 || ^19.0.0"
+    "vue": "^3.0.0"
   },
   "devDependencies": {
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "vue": "^3.4.0",
     "rimraf": "^6.0.1",
     "tsup": "^8.2.4",
     "typescript": "^5.5.4",
     "zerithdb-eslint-config": "workspace:*",
     "zerithdb-tsconfig": "workspace:*"
-  },
-  "files": [
-    "dist",
-    "src"
-  ]
+  }
 }
