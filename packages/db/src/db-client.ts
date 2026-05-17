@@ -42,7 +42,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Automatically assigns `_id`, `_createdAt`, and `_updatedAt`.
    */
   async insert(document: T): Promise<InsertResult> {
-    if (!document) {
+    if (document === null || document === undefined) {
       throw new ZerithDBError(ErrorCode.DB_WRITE_FAILED, "Document cannot be null or undefined");
     }
     const now = Date.now();

@@ -33,8 +33,9 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --treeshake",
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
-    "test": "vitest run --root ../.. --environment node packages/sdk/src/video-conference.test.ts",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run --root ../.. packages/sdk/src",
     "clean": "rimraf dist"
   },
   "dependencies": {
