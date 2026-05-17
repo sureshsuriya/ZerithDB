@@ -16,8 +16,8 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --treeshake --external svelte",
-    "dev": "tsup src/index.ts --format esm,cjs --dts --watch --external svelte",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json",
     "clean": "rimraf dist"
   },

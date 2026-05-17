@@ -33,6 +33,11 @@ export interface SyncConfig {
    * @default "auto"
    */
   transport?: "auto" | "websocket" | "polling";
+  ephemeral?: {
+    cleanupIntervalMs?: number;
+    throttleMs?: number;
+    staleAfterMs?: number;
+  };
 }
 
 export interface AuthConfig {

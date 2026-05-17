@@ -27,3 +27,45 @@ export interface NetworkMessage {
   /** Optional Ed25519 signature for authenticity verification */
   signature?: string;
 }
+
+export interface MediaStreamTrackMetadata {
+  trackId: string;
+  kind: "audio" | "video";
+  label: string;
+  enabled: boolean;
+  muted: boolean;
+  readyState: MediaStreamTrackState;
+}
+
+export interface MediaStreamMetadata {
+  streamId: string;
+  peerId: PeerId;
+  kind: "camera" | "screen" | "custom";
+  audioMuted: boolean;
+  videoMuted: boolean;
+  tracks: MediaStreamTrackMetadata[];
+  updatedAt: number;
+}
+
+export interface MediaStreamMetadataInput {
+  kind?: "camera" | "screen" | "custom";
+  label?: string;
+  [key: string]: unknown;
+}
+
+export interface ActiveSpeakerState {
+  peerId: string;
+  updatedAt: number;
+  audioLevel?: number;
+  [key: string]: unknown;
+}
+
+export interface VideoParticipantState {
+  peerId: string;
+  muted: { audio: boolean; video: boolean };
+  streams: Record<string, MediaStreamMetadata>;
+  updatedAt: number;
+  activeSpeaker?: ActiveSpeakerState;
+  [key: string]: unknown;
+}
+
