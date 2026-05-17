@@ -36,8 +36,6 @@ type NetworkEvents = {
   "media:stream:removed": { peerId: PeerId; streamId: string };
   error: { peerId: PeerId; error: Error };
   "transport:downgrade": { from: "websocket"; to: "polling"; reason: string };
-  "media:stream": { peerId: PeerId; stream: MediaStream; metadata?: MediaStreamMetadata };
-  "media:stream:removed": { peerId: PeerId; streamId: string };
 };
 
 export type MediaStreamMetadataInput = Partial<
@@ -92,7 +90,6 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   private readonly nameRegistry = new NameRegistry();
   private ensResolver: MockENSResolver;
 
-  private readonly localStreams = new Map<string, { stream: MediaStream; metadata: MediaStreamMetadata }>();
 
   constructor(
     private readonly config: ZerithDBConfig,
@@ -115,108 +112,9 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     return this.localPeerId;
   }
 
-
   /** The transport type currently in use, or null if not connected */
   get transportType(): "websocket" | "polling" | null {
     return this.activeTransportType;
-  }
-
-  /** The local peer identifier assigned to this network node */
-  get peerId(): PeerId {
-    return this.localPeerId;
-  }
-
-  addMediaStream(stream: MediaStream, metadataInput?: MediaStreamMetadataInput): MediaStreamMetadata {
-    const tracks = stream.getTracks().map((track) => ({
-      trackId: track.id,
-      kind: track.kind as "audio" | "video",
-      label: track.label,
-      enabled: track.enabled,
-      muted: track.muted,
-      readyState: track.readyState as MediaStreamTrackState,
-    }));
-
-    const metadata: MediaStreamMetadata = {
-      streamId: stream.id,
-      peerId: this.localPeerId,
-      kind: (metadataInput?.kind as "camera" | "screen" | "custom") ?? "camera",
-      audioMuted: tracks.filter((track) => track.kind === "audio").every((track) => !track.enabled),
-      videoMuted: tracks.filter((track) => track.kind === "video").every((track) => !track.enabled),
-      tracks,
-      updatedAt: Date.now(),
-    };
-
-    this.localStreams.set(stream.id, { stream, metadata });
-
-    for (const peer of this.peers.values()) {
-      try {
-        peer.addStream(stream);
-      } catch (err) {
-        console.warn("[NetworkManager] Failed to add stream to peer:", err);
-      }
-    }
-
-    return metadata;
-  }
-
-  removeMediaStream(streamOrId: MediaStream | string): void {
-    const streamId = typeof streamOrId === "string" ? streamOrId : streamOrId.id;
-    const entry = this.localStreams.get(streamId);
-    if (!entry) return;
-
-    this.localStreams.delete(streamId);
-
-    for (const peer of this.peers.values()) {
-      try {
-        peer.removeStream(entry.stream);
-      } catch (err) {
-        console.warn("[NetworkManager] Failed to remove stream from peer:", err);
-      }
-    }
-  }
-
-  updateMediaStreamMetadata(
-    streamId: string,
-    metadataInput: MediaStreamMetadataInput
-  ): MediaStreamMetadata | undefined {
-    const entry = this.localStreams.get(streamId);
-    if (!entry) return undefined;
-
-    if (metadataInput.kind) {
-      entry.metadata.kind = metadataInput.kind;
-    }
-    entry.metadata.updatedAt = Date.now();
-    return entry.metadata;
-  }
-
-  setMediaTrackEnabled(kind: "audio" | "video", enabled: boolean, streamId?: string): void {
-    for (const entry of this.localStreams.values()) {
-      if (streamId !== undefined && entry.metadata.streamId !== streamId) continue;
-
-      for (const track of entry.stream.getTracks()) {
-        if (track.kind === kind) {
-          track.enabled = enabled;
-        }
-      }
-
-      const tracks = entry.stream.getTracks().map((track) => ({
-        trackId: track.id,
-        kind: track.kind as "audio" | "video",
-        label: track.label,
-        enabled: track.enabled,
-        muted: track.muted,
-        readyState: track.readyState as MediaStreamTrackState,
-      }));
-
-      entry.metadata.tracks = tracks;
-      entry.metadata.audioMuted = tracks.filter((t) => t.kind === "audio").every((t) => !t.enabled);
-      entry.metadata.videoMuted = tracks.filter((t) => t.kind === "video").every((t) => !t.enabled);
-      entry.metadata.updatedAt = Date.now();
-    }
-  }
-
-  getLocalMediaStreamMetadata(): MediaStreamMetadata[] {
-    return Array.from(this.localStreams.values()).map((e) => e.metadata);
   }
 
   /**
@@ -533,9 +431,9 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       },
     });
 
-    for (const entry of this.localStreams.values()) {
+    for (const stream of this.localStreams.values()) {
       try {
-        peer.addStream(entry.stream);
+        peer.addStream(stream);
       } catch (err) {
         console.warn("[NetworkManager] Failed to add local stream to new peer:", err);
       }
