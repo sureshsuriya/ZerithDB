@@ -26,10 +26,17 @@ export type {
   PeerInfo,
   RoomId,
   NetworkMessage,
+  MediaStreamKind,
+  MediaTrackMetadata,
   MediaStreamMetadata,
-  MediaStreamMetadataInput,
-  ActiveSpeakerState,
-  VideoParticipantState,
 } from "./types/network.js";
 export type { Identity, PublicKey, Signature } from "./types/auth.js";
-export type { SyncUpdate, SyncState, AwarenessState, SyncPlugin, EphemeralPeerState } from "./types/sync.js";
+export type {
+  SyncUpdate,
+  SyncState,
+  AwarenessState,
+  SyncPlugin,
+  EphemeralPeerState,
+  ActiveSpeakerState,
+  VideoParticipantState,
+} from "./types/sync.js";

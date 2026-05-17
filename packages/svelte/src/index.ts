@@ -55,10 +55,7 @@ export function collectionStore<T = any>(collectionName: string) {
 /**
  * Derived store that filters a collection by a predicate.
  */
-export function filteredStore<T = any>(
-  collectionName: string,
-  predicate: (item: T) => boolean
-) {
+export function filteredStore<T = any>(collectionName: string, predicate: (item: T) => boolean) {
   const base = collectionStore<T>(collectionName);
   const filtered = derived(base, ($items) => $items.filter(predicate));
   return filtered;
@@ -67,16 +64,12 @@ export function filteredStore<T = any>(
 /**
  * Derived store that sorts a collection by a key.
  */
-export function sortedStore<T = any>(
-  collectionName: string,
-  compareFn: (a: T, b: T) => number
-) {
+export function sortedStore<T = any>(collectionName: string, compareFn: (a: T, b: T) => number) {
   const base = collectionStore<T>(collectionName);
   const sorted = derived(base, ($items) => [...$items].sort(compareFn));
   return sorted;
 }
-
-export { syncField, syncPresence } from "./useSyncField";
+export { syncField, syncPresence } from "./useSyncField.js";
 export { default as SyncInput } from "./components/SyncInput.svelte";
 export { default as SyncCheckbox } from "./components/SyncCheckbox.svelte";
 export { default as SyncToggle } from "./components/SyncToggle.svelte";
