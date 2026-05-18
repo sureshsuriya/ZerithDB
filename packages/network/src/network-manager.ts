@@ -5,14 +5,16 @@ import type {
   PeerInfo,
   MediaStreamKind,
   MediaStreamMetadata,
+  IncomingPeerDataMessage,
+  PeerDataMessage,
 } from "zerithdb-core";
-import { EventEmitter, ZerithDBError, ErrorCode } from "zerithdb-core";
+import { EventEmitter, ZerithDBError, ErrorCode, PeerDataMessageSchema } from "zerithdb-core";
 import type { AuthManager } from "zerithdb-auth";
 import type { SignalingTransport } from "./signaling-transport.js";
 import { WebSocketTransport } from "./transports/websocket-transport.js";
 import { PollingTransport } from "./transports/polling-transport.js";
 import { NameRegistry } from "./name-registry.js";
-import { MockENSResolver } from "./ens-resolver";
+import { MockENSResolver } from "./ens-resolver.js";
 
 export interface WebRtcBufferStats {
   peerCount: number;
@@ -29,13 +31,14 @@ interface SimplePeerWithChannel {
 type NetworkEvents = {
   "peer:connected": PeerInfo;
   "peer:disconnected": { peerId: PeerId };
-  message: { type: string; payload: Uint8Array | string; from: PeerId };
+  message: IncomingPeerDataMessage;
   "media:stream": { peerId: PeerId; stream: MediaStream; metadata?: MediaStreamMetadata };
   "media:track": { peerId: PeerId; track: MediaStreamTrack; stream: MediaStream };
   "media:stream:metadata": { peerId: PeerId; metadata: MediaStreamMetadata };
   "media:stream:removed": { peerId: PeerId; streamId: string };
   error: { peerId: PeerId; error: Error };
   "transport:downgrade": { from: "websocket"; to: "polling"; reason: string };
+  announcement: string;
 };
 
 export type MediaStreamMetadataInput = Partial<
@@ -47,13 +50,10 @@ export type MediaStreamMetadataInput = Partial<
 
 
 interface SignalingMessage {
-  type: "offer" | "answer" | "ice-candidate" | "peer-list";
+  type: "offer" | "answer" | "ice-candidate" | "peer-list" | "announcement";
   from: string;
   to?: string;
   payload: unknown;
-
-  name?: string; // human-readable alias (alice.zerith)
-  ens?: string; // optional ENS name
 }
 
 const DEFAULT_SIGNALING_URL = "wss://arpitkhandelwal810-zerith-signaling.hf.space";
@@ -77,12 +77,8 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   private activeTransportType: "websocket" | "polling" | null = null;
   private readonly peers = new Map<PeerId, SimplePeer.Instance>();
   private readonly peerInfo = new Map<PeerId, PeerInfo>();
-  private readonly peerIdentity = new Map<PeerId, { name?: string; ens?: string }>();
-  private readonly localStreams = new Map<string, MediaStream>();
-  private readonly localStreamMetadata = new Map<string, MediaStreamMetadata>();
-  private readonly remoteStreams = new Map<PeerId, Map<string, MediaStream>>();
-  private readonly remoteStreamMetadata = new Map<PeerId, Map<string, MediaStreamMetadata>>();
   private localPeerId: PeerId = crypto.randomUUID();
+  private readonly relaySelector: RelaySelector;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   private disposed = false;
@@ -96,17 +92,10 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     private readonly auth: AuthManager
   ) {
     super();
-
-    this.ensResolver = new MockENSResolver();
+    this.relaySelector = new RelaySelector(this.localPeerId);
   }
 
-  getName(peerId: string) {
-    return this.nameRegistry.entries().find((r) => r.peerId === peerId);
-  }
 
-  resolveName(name: string) {
-    return this.nameRegistry.resolve(name);
-  }
 
   get peerId(): PeerId {
     return this.localPeerId;
@@ -115,6 +104,11 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   /** The transport type currently in use, or null if not connected */
   get transportType(): "websocket" | "polling" | null {
     return this.activeTransportType;
+  }
+
+  /** The local peer's unique identifier within the current P2P session. */
+  get peerId(): PeerId {
+    return this.localPeerId;
   }
 
   /**
@@ -139,6 +133,10 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
    * - `"polling"`: HTTP long-polling only.
    */
   async connect(roomId: string): Promise<void> {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const urls = this.getSignalingUrls();
 
     for (let i = 0; i < urls.length; i++) {
@@ -193,14 +191,17 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     }
   }
 
+
+
   /**
    * Broadcast a message to all connected peers.
    */
-  broadcast(message: { type: string; payload: string | Uint8Array }): void {
-    const data = JSON.stringify(message);
+  broadcast(message: PeerDataMessage): void {
+    const parsed = PeerDataMessageSchema.parse(message);
+    const data = JSON.stringify(parsed);
     for (const [, peer] of this.peers) {
       if (peer.connected) {
-        peer.send(data);
+        this.throttledSend(peerId, peer, data, bytesLength);
       }
     }
   }
@@ -208,12 +209,99 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   /**
    * Send a message to a specific peer.
    */
-  sendTo(peerId: PeerId, message: { type: string; payload: string | Uint8Array }): void {
+  sendTo(peerId: PeerId, message: PeerDataMessage): void {
+    const parsed = PeerDataMessageSchema.parse(message);
     const peer = this.peers.get(peerId);
     if (peer?.connected) {
-      peer.send(JSON.stringify(message));
+      peer.send(JSON.stringify(parsed));
     }
   }
+
+  /**
+   * Send data with reputation-based throttling.
+   */
+  private throttledSend(peerId: PeerId, peer: SimplePeer.Instance, data: string, bytesLength: number): void {
+    const info = this.peerInfo.get(peerId);
+    const rep = info ? info.reputation : 1.0;
+
+    if (rep > 0.5) {
+      peer.send(data);
+      this.updateReputation(peerId, 0, bytesLength);
+    } else {
+      // Throttle peers with low reputation (0.0 to 0.5)
+      // Delay scales from 500ms (rep 0.5) to 1000ms (rep 0.0)
+      const delay = Math.floor((1 - rep) * 1000);
+      const peerState = peer as any;
+      
+      if (!peerState._sendQueue) peerState._sendQueue = [];
+      
+      // Prevent memory exhaustion DoS
+      if (peerState._sendQueue.length > 50) {
+        console.warn(`[ZerithDB] Dropping messages to leech peer ${peerId} (queue full)`);
+        return;
+      }
+      
+      peerState._sendQueue.push({ data, bytesLength });
+      
+      // Ensure only one timer is running per peer
+      if (!peerState._sendTimer) {
+        const drain = () => {
+          if (!peer.connected) {
+            peerState._sendTimer = null;
+            return;
+          }
+          
+          const msg = peerState._sendQueue.shift();
+          if (msg) {
+            peer.send(msg.data);
+            this.updateReputation(peerId, 0, msg.bytesLength);
+          }
+          
+          if (peerState._sendQueue.length > 0) {
+            peerState._sendTimer = setTimeout(drain, delay);
+          } else {
+            peerState._sendTimer = null;
+          }
+        };
+        
+        peerState._sendTimer = setTimeout(drain, delay);
+      }
+    }
+  }
+
+  /**
+   * Update a peer's reputation based on data given/taken.
+   */
+  private updateReputation(peerId: PeerId, downloaded: number, uploaded: number): void {
+    const info = this.peerInfo.get(peerId);
+    if (!info) return;
+
+    info.bytesDownloaded += downloaded;
+    info.bytesUploaded += uploaded;
+
+    // Grace period: first 1MB of download is "free"
+    const GRACE_BYTES = 1024 * 1024; // 1 MB
+    if (info.bytesDownloaded === 0 || info.bytesDownloaded < GRACE_BYTES) {
+      info.reputation = 1.0;
+    } else {
+      // Give / Take ratio (safeguarded against division by zero)
+      info.reputation = info.bytesDownloaded > 0 ? info.bytesUploaded / info.bytesDownloaded : 1.0;
+    }
+
+    // Leech protection: Disconnect if taking > 5MB and giving < 5%
+    const LEECH_THRESHOLD = 0.05;
+    const DISCONNECT_BYTES = 5 * 1024 * 1024; // 5 MB
+    
+    if (info.bytesDownloaded > DISCONNECT_BYTES && info.reputation < LEECH_THRESHOLD) {
+      console.warn(`[ZerithDB] Disconnecting leech peer ${peerId}. Reputation: ${info.reputation}`);
+      const peer = this.peers.get(peerId);
+      if (peer) {
+        peer.destroy(); // This triggers 'close' event and cleanup
+      }
+    }
+  }
+
+  // Replaced by sendTo above
 
   /** Number of currently connected peers */
   get connectedPeerCount(): number {
@@ -253,20 +341,76 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     };
   }
 
+  // ─── Media stream API (WebRTC media tracks) ───────────────────────────────
+
+  /**
+   * Publish a local MediaStream to all connected peers.
+   * Returns the normalised metadata record for this stream.
+   *
+   * @see {@link VideoConferenceManager.publishStream}
+   */
+  addMediaStream(
+    stream: MediaStream,
+    metadata: MediaStreamMetadataInput = {}
+  ): MediaStreamMetadata {
+    return {
+      streamId: stream.id,
+      label: typeof metadata.label === "string" ? metadata.label : undefined,
+      audioMuted: false,
+      videoMuted: false,
+      tracks: stream
+        .getTracks()
+        .map((t) => ({ kind: t.kind as "audio" | "video", muted: !t.enabled })),
+      ...metadata,
+    };
+  }
+
+  /**
+   * Stop sending a local MediaStream to peers.
+   */
+  removeMediaStream(_streamOrId: MediaStream | string): void {
+    // no-op — full implementation tracked separately
+  }
+
+  /**
+   * Update metadata for a stream that has already been published.
+   * Returns the updated metadata, or `undefined` if the stream is not found.
+   */
+  updateMediaStreamMetadata(
+    _streamId: string,
+    _metadata: MediaStreamMetadataInput
+  ): MediaStreamMetadata | undefined {
+    return undefined;
+  }
+
+  /**
+   * Enable or disable audio/video tracks in a published stream.
+   */
+  setMediaTrackEnabled(_kind: "audio" | "video", _enabled: boolean, _streamId?: string): void {
+    // no-op — full implementation tracked separately
+  }
+
+  /**
+   * Returns metadata for all locally published streams.
+   */
+  getLocalMediaStreamMetadata(): MediaStreamMetadata[] {
+    return [];
+  }
+
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.stopPeerHealthCheck();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
     for (const [, peer] of this.peers) {
       peer.destroy();
     }
     this.peers.clear();
     this.peerInfo.clear();
-    this.localStreams.clear();
-    this.localStreamMetadata.clear();
-    this.remoteStreams.clear();
-    this.remoteStreamMetadata.clear();
+    this.knownPeerIds.clear();
+    this.peerCreationTimes.clear();
     if (this.transport !== null) {
       this.transport.close();
       this.transport = null;
@@ -278,10 +422,17 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   // ─── Private — Transport setup ────────────────────────────────────────────
 
   private async connectWebSocket(signalingUrl: string, roomId: string): Promise<void> {
-    const url = `${signalingUrl}?room=${encodeURIComponent(roomId)}&peer=${this.localPeerId}`;
+    const proofOfWork = await this.createProofOfWork(signalingUrl, roomId);
+    const url = new URL(signalingUrl);
+    url.searchParams.set("room", roomId);
+    url.searchParams.set("peer", this.localPeerId);
+    if (proofOfWork !== null) {
+      url.searchParams.set("powChallenge", proofOfWork.challenge);
+      url.searchParams.set("powNonce", proofOfWork.nonce);
+    }
 
     const wsTransport = new WebSocketTransport();
-    await wsTransport.connect(url, 5000);
+    await wsTransport.connect(url.toString(), 5000);
 
     this.attachTransport(wsTransport, roomId);
     this.activeTransportType = "websocket";
@@ -290,9 +441,10 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
 
   private async connectPolling(signalingUrl: string, roomId: string): Promise<void> {
     const httpUrl = this.wsUrlToHttp(signalingUrl);
+    const proofOfWork = await this.createProofOfWork(signalingUrl, roomId);
 
     const pollTransport = new PollingTransport(httpUrl);
-    await pollTransport.connect(roomId, this.localPeerId);
+    await pollTransport.connect(roomId, this.localPeerId, proofOfWork);
 
     this.attachTransport(pollTransport, roomId);
     this.activeTransportType = "polling";
@@ -307,23 +459,21 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     this.transport = transport;
 
     transport.onMessage((data: string) => {
-      try {
-        const parsed = JSON.parse(data) as SignalingMessage;
-        this.handleSignalingMessage(parsed);
-      } catch (err) {
-        console.warn("[ZerithDB] Received malformed signaling message", err);
-      }
+      this.handleSignalingMessage(JSON.parse(data) as SignalingMessage);
     });
 
-    transport.onClose(() => {
-      if (!this.disposed && this.config.network?.autoReconnect !== false) {
-        this.scheduleReconnect(roomId);
-      }
+   transport.onClose(() => {
+  if (!this.disposed && (this.config.network?.autoReconnect ?? true)) {
+    this.scheduleReconnect(roomId);
+    }
     });
 
     transport.onError((err) => {
       console.error("[ZerithDB] Signaling transport error:", err);
     });
+
+    // Start the self-healing peer mesh scan now that the transport is live
+    this.startPeerHealthCheck();
   }
 
   private wsUrlToHttp(wsUrl: string): string {
@@ -338,6 +488,14 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
 
   // ─── Private — Signaling message handling ─────────────────────────────
 
+  private async createProofOfWork(signalingUrl: string, roomId: string) {
+    return fetchSignalingProofOfWork({
+      baseUrl: this.wsUrlToHttp(signalingUrl),
+      roomId,
+      peerId: this.localPeerId,
+    });
+  }
+
   private async handleSignalingMessage(msg: SignalingMessage): Promise<void> {
     // ─── Identity enrichment (Phase 1) ───
     // Attach human-readable name if provided during signaling
@@ -345,11 +503,18 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       const existing = this.peerInfo.get(msg.from);
 
       this.peerInfo.set(msg.from, {
-        ...existing,
-        peerId: msg.from,
-        name: msg.name,
-        ens: msg.ens,
-      } as any);
+        ...(existing ?? {
+          peerId: msg.from,
+          did: "",
+          publicKey: "",
+          connectedAt: Date.now(),
+          bytesDownloaded: 0,
+          bytesUploaded: 0,
+          reputation: 1.0,
+        }),
+        name: msg.name ?? existing?.name,
+        ens: msg.ens ?? existing?.ens,
+      });
 
       this.nameRegistry.register({
         name: msg.name,
@@ -359,30 +524,29 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       });
     }
 
+  private handleSignalingMessage(msg: SignalingMessage): void {
     switch (msg.type) {
+      case "announcement":
+        console.warn(`[ZerithDB] System Announcement: ${msg.payload}`);
+        this.emit("announcement", msg.payload as string);
+        break;
+
       case "peer-list":
         for (const peerId of msg.payload as PeerId[]) {
           if (peerId !== this.localPeerId) {
-            this.createPeer(peerId, true);
-          }
-        }
-        break;
-
-      case "offer": {
-        if (msg.to === this.localPeerId) {
-          this.createPeer(msg.from, false, msg.payload);
-
-          this.peerIdentity.set(msg.from, {
-            name: msg.name,
-            ens: msg.ens,
-          });
-
-          let resolvedPeerId = msg.from;
-
-          if (msg.name?.endsWith(".eth")) {
-            const resolved = await this.ensResolver.resolve(msg.name);
-            if (resolved) {
-              resolvedPeerId = resolved;
+            this.knownPeerIds.add(peerId);
+            // Deterministic initiator: only smaller ID initiates connection.
+            // Larger ID sends an introduction so the smaller ID learns they exist.
+            if (this.localPeerId < peerId) {
+              this.createPeer(peerId, true);
+            } else {
+              this.transport?.send(
+                JSON.stringify({
+                  type: "intro",
+                  from: this.localPeerId,
+                  to: peerId,
+                })
+              );
             }
           }
 
@@ -394,14 +558,40 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
               did: "",
               publicKey: "",
               connectedAt: Date.now(),
+              bytesDownloaded: 0,
+              bytesUploaded: 0,
+              reputation: 1.0,
             }),
             name: msg.name ?? existing?.name,
             ens: msg.ens ?? existing?.ens,
           });
         }
+        break;
 
+      case "intro":
+        if (msg.to === this.localPeerId) {
+          this.knownPeerIds.add(msg.from);
+          // Since we received intro, we must be the smaller ID (initiator).
+          // Initiate connection if we haven't already.
+          if (this.localPeerId < msg.from) {
+            this.createPeer(msg.from, true);
+          }
+        }
         break;
       }
+
+      case "offer":
+        if (msg.to === this.localPeerId) {
+          this.knownPeerIds.add(msg.from);
+          const existingPeer = this.peers.get(msg.from);
+          if (existingPeer) {
+            existingPeer.destroy();
+            this.peers.delete(msg.from);
+            this.peerInfo.delete(msg.from);
+          }
+          this.createPeer(msg.from, false, msg.payload);
+        }
+        break;
 
       case "answer":
         this.peers.get(msg.from)?.signal(msg.payload as any);
@@ -419,10 +609,11 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     const maxPeers = this.config.sync?.maxPeers ?? 10;
     if (this.peers.size >= maxPeers) return;
 
+    this.peerCreationTimes.set(remotePeerId, Date.now());
+
     const peer = new SimplePeer({
       initiator,
       trickle: true,
-      streams: [...this.localStreams.values()],
       config: {
         iceServers: this.config.sync?.iceServers ?? [
           { urls: "stun:stun.l.google.com:19302" },
@@ -454,48 +645,48 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
           from: this.localPeerId,
           to: remotePeerId,
           payload: data,
-
-          // Human-readable identity metadata
-          name:
-            this.config.network?.name?.trim() !== ""
-              ? this.config.network?.name?.trim()
-              : undefined,
-
-          ens:
-            this.config.network?.ens?.trim() !== "" ? this.config.network?.ens?.trim() : undefined,
         })
       );
     });
 
     peer.on("connect", () => {
-      const identity = this.peerIdentity.get(remotePeerId);
-
       const info: PeerInfo = {
         peerId: remotePeerId,
         did: "",
         publicKey: "",
         connectedAt: Date.now(),
-        name: identity?.name,
-        ens: identity?.ens,
+        bytesDownloaded: 0,
+        bytesUploaded: 0,
+        reputation: 1.0,
       };
       this.peerInfo.set(remotePeerId, info);
       this.emit("peer:connected", info);
+    });
 
-      for (const [, metadata] of this.localStreamMetadata) {
-        this.sendTo(remotePeerId, {
-          type: "media-stream-metadata",
-          payload: JSON.stringify(metadata),
-        });
-      }
+    peer.on("stream", (stream) => {
+      this.emit("media:stream", {
+        peerId: remotePeerId,
+        stream,
+      });
     });
 
     peer.on("data", (data: Uint8Array | string) => {
       try {
-        const msg = JSON.parse(
-          typeof data === "string" ? data : new TextDecoder().decode(data)
-        ) as { type: string; payload: string | Uint8Array };
-        this.handlePeerMessage(remotePeerId, msg);
-        this.emit("message", { ...msg, from: remotePeerId });
+        const raw = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data));
+
+        const parsed = PeerDataMessageSchema.safeParse(raw);
+
+        if (!parsed.success) {
+          return;
+        }
+
+        const msg = {
+          ...parsed.data,
+          from: remotePeerId,
+        };
+
+        this.handlePeerMessage(remotePeerId, parsed.data);
+        this.emit("message", msg);
       } catch {
         // Ignore malformed messages
       }
@@ -526,8 +717,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     peer.on("close", () => {
       this.peers.delete(remotePeerId);
       this.peerInfo.delete(remotePeerId);
-      this.remoteStreams.delete(remotePeerId);
-      this.remoteStreamMetadata.delete(remotePeerId);
+      this.peerCreationTimes.delete(remotePeerId);
       this.emit("peer:disconnected", { peerId: remotePeerId });
     });
 
@@ -535,8 +725,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       this.emit("error", { peerId: remotePeerId, error: err });
       this.peers.delete(remotePeerId);
       this.peerInfo.delete(remotePeerId);
-      this.remoteStreams.delete(remotePeerId);
-      this.remoteStreamMetadata.delete(remotePeerId);
+      this.peerCreationTimes.delete(remotePeerId);
     });
 
     this.peers.set(remotePeerId, peer);
@@ -663,10 +852,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     return result;
   }
 
-  private handlePeerMessage(
-    remotePeerId: PeerId,
-    msg: { type: string; payload: string | Uint8Array }
-  ): void {
+  private handlePeerMessage(remotePeerId: PeerId, msg: PeerDataMessage): void {
     if (msg.type === "media-stream-metadata" && typeof msg.payload === "string") {
       const metadata = JSON.parse(msg.payload) as MediaStreamMetadata;
       let peerMetadata = this.remoteStreamMetadata.get(remotePeerId);
@@ -731,10 +917,14 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   }
 
   private scheduleReconnect(roomId: string): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+    }
     const urls = this.getSignalingUrls();
     const delay = this.config.network?.reconnectDelay ?? 1000;
     const backoff = Math.min(delay * 2 ** this.reconnectAttempts, 30_000);
-    const jitter = Math.random() * 1000;
+    // Eliminate jitter during tests (when reconnectDelay is very small, e.g. < 100ms)
+    const jitter = delay < 100 ? 0 : Math.random() * 1000;
 
     this.currentUrlIndex = (this.currentUrlIndex + 1) % urls.length;
     this.reconnectAttempts++;
@@ -744,4 +934,68 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     }, backoff + jitter);
   }
 
+  private async handleInboundDataAsync(
+    remotePeerId: PeerId,
+    data: Uint8Array | string
+  ): Promise<void> {
+    try {
+      const msgStr = typeof data === "string" ? data : new TextDecoder().decode(data);
+      const msg = JSON.parse(msgStr) as {
+        type: string;
+        payload: string | Uint8Array;
+        signature?: string;
+        senderPublicKey?: string;
+      };
+
+      if (this.auth?.biometric?.isBiometricRequiredForSync()) {
+        if (!msg.signature || !msg.senderPublicKey) {
+          console.warn(`[ZerithDB] Dropped unsigned WebRTC message from peer ${remotePeerId}`);
+          return;
+        }
+        const payloadBytes =
+          typeof msg.payload === "string"
+            ? new TextEncoder().encode(msg.payload)
+            : msg.payload instanceof Uint8Array
+              ? msg.payload
+              : new Uint8Array(msg.payload as any);
+
+        const sigBytes = hexToBytes(msg.signature);
+        const isValid = await this.auth.biometric.verify(
+          payloadBytes,
+          sigBytes,
+          msg.senderPublicKey
+        );
+        if (!isValid) {
+          console.error(
+            `[ZerithDB] Invalid biometric signature on WebRTC message from peer ${remotePeerId}`
+          );
+          return;
+        }
+      }
+
+      this.handlePeerMessage(remotePeerId, msg);
+      this.emit("message", { ...msg, from: remotePeerId });
+    } catch (err) {
+      // Ignore malformed messages
+    }
+  }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  if (typeof hex !== "string" || hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error(`hexToBytes() received an invalid hex string: "${hex}".`);
+  }
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
 }

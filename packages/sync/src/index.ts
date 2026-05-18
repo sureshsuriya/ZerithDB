@@ -9,3 +9,6 @@ export type {
   QueuedMutationStatus,
 } from "./queue/types.js";
 export type { EphemeralSetOptions } from "./ephemeral-state.js";
+export { PostgresReplicationAdapter, PostgresWALStreamer } from "./postgres.js";
+export type { PostgresWalEvent, PgColumn, PostgresReplicationConfig } from "./postgres.js";
+
